@@ -1,0 +1,188 @@
+# Muni arrivals display — Waveshare ESP32-P4-WIFI6-Touch-LCD-4C (4" round, 720x720).
+# Shows the next two 5 Fulton arrivals on Market St between 5th & 4th (stop 15644), from 511.org.
+#
+# Hardware settings are verified on a chip-revision v3.2 board. See "Hardware notes for
+# this board" in README.md for why each one is set the way it is.
+
+substitutions:
+  name: muni-display
+  timezone: America/Los_Angeles
+  route: "5"                   # LineRef to show; other lines at the stop are ignored
+  route_name: "Fulton"
+  stop_label: "Market + 4th"   # short name for the bottom line
+  refresh: 90s                 # 511 allows 60 requests an hour per token
+
+  # Backlight GPIO26 is active-low (inverted below); panel reset is GPIO27.
+  # Both per Waveshare's board support code for the 4B/4C.
+  bl_pwm: GPIO26
+  lcd_reset: GPIO27
+  # C6 Wi-Fi link: confirmed for the 4C (SKU 31522) in esphome/esphome issue #19990.
+  sdio_reset: GPIO54
+  sdio_cmd: GPIO19
+  sdio_clk: GPIO18
+  sdio_d0: GPIO14
+  sdio_d1: GPIO15
+  sdio_d2: GPIO16
+  sdio_d3: GPIO17
+
+esphome:
+  name: ${name}
+  min_version: 2026.2.0
+  includes:
+    - muni.h
+
+esp32:
+  # No `board:` here: esp32-p4-evboard builds for engineering-sample chips
+  # (rev < 3.0), and this board has a production v3.x chip, so that build crashed at boot.
+  variant: esp32p4
+  engineering_sample: false
+  framework:
+    type: esp-idf
+
+psram:
+  mode: hex
+  speed: 200MHz   # the default 20MHz is too slow for the display ("underrun happens")
+
+esp_ldo:
+  - id: ldo_mipi_phy
+    channel: 3
+    voltage: 2.5V
+
+esp32_hosted:
+  variant: ESP32C6
+  slot: 1
+  active_high: true
+  reset_pin: ${sdio_reset}
+  cmd_pin: ${sdio_cmd}
+  clk_pin: ${sdio_clk}
+  d0_pin: ${sdio_d0}
+  d1_pin: ${sdio_d1}
+  d2_pin: ${sdio_d2}
+  d3_pin: ${sdio_d3}
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  on_connect:
+    - delay: 3s
+    - script.execute: fetch_arrivals
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone}
+
+ota:
+  - platform: esphome
+
+logger:
+
+json:
+
+http_request:
+  verify_ssl: true   # uses ESP-IDF's built-in certificate bundle
+  timeout: 15s
+
+script:
+  - id: fetch_arrivals
+    mode: single
+    then:
+      - http_request.get:
+          url: !secret api_511_url
+          capture_response: true
+          max_response_buffer_size: 16kB
+          on_response:
+            then:
+              - lambda: |-
+                  auto t = id(sntp_time).now();
+                  muni::handle_response(response->status_code, body, "${route}",
+                                        t.is_valid() ? t.timestamp : 0, millis());
+          on_error:
+            then:
+              - lambda: |-
+                  muni::g_state.error = "Can't reach 511";
+
+interval:
+  - interval: ${refresh}
+    then:
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - script.execute: fetch_arrivals
+
+light:
+  - platform: monochromatic
+    id: backlight
+    output: bl_pwm_out
+    restore_mode: ALWAYS_ON
+
+output:
+  - platform: ledc
+    id: bl_pwm_out
+    pin: ${bl_pwm}
+    inverted: true     # the backlight turns ON when this pin is LOW
+    frequency: 2000Hz
+
+font:
+  - file: { type: gfonts, family: Roboto, weight: 500 }
+    id: font_big
+    size: 482
+    bpp: 4
+    glyphs: "0123456789"
+  - file: { type: gfonts, family: Roboto, weight: 500 }
+    id: font_now
+    size: 300
+    bpp: 4
+    glyphs: "Now0123456789"
+  - file: { type: gfonts, family: Roboto, weight: 500 }
+    id: font_second
+    size: 92
+    bpp: 4
+    glyphs: "0123456789Now"
+  - file: { type: gfonts, family: Roboto, weight: 400 }
+    id: font_second_unit
+    size: 36
+    bpp: 4
+    glyphs: "m"
+  - file: { type: gfonts, family: Roboto, weight: 500 }
+    id: font_header
+    size: 36
+    bpp: 4
+    glyphs: &text_glyphs " !&'()+,-./0123456789:?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz·"
+  - file: { type: gfonts, family: Roboto, weight: 400 }
+    id: font_body
+    size: 28
+    bpp: 4
+    glyphs: *text_glyphs
+  - file: { type: gfonts, family: Roboto, weight: 400 }
+    id: font_small
+    size: 24
+    bpp: 4
+    glyphs: *text_glyphs
+  - file: { type: gfonts, family: Roboto, weight: 500 }
+    id: font_badge
+    size: 38
+    bpp: 4
+    glyphs: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+display:
+  - platform: mipi_dsi
+    id: main_display
+    model: WAVESHARE-ESP32-P4-WIFI6-TOUCH-LCD-4C
+    reset_pin: ${lcd_reset}
+    rotation: 180      # USB cable exits at the bottom when mounted
+    # This panel ignores ESPHome's hardware flip, so make the firmware rotate the image itself.
+    transform: disabled
+    dimensions:
+      width: 720
+      height: 720
+    color_depth: 16
+    update_interval: 5s   # minutes count down on the board's own clock between fetches
+    lambda: |-
+      muni::render(it,
+          muni::Fonts{id(font_big), id(font_now), id(font_second),
+                      id(font_second_unit), id(font_header), id(font_body), id(font_small),
+                      id(font_badge)},
+          muni::Labels{"${route}", "${route_name}", "${stop_label}"},
+          id(sntp_time).now(), millis());

@@ -1,0 +1,12 @@
+# Your Wi-Fi details and 511 token
+secrets.yaml
+
+# ESPHome build output and the local Python environment
+.esphome/
+.venv/
+
+# Logs captured from the board can include network details
+*.log
+
+test/build/
+__pycache__/
